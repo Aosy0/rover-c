@@ -1,0 +1,258 @@
+#include <M5Unified.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define ROVERC_I2C_ADDR 0x38
+#define CMD_TIMEOUT_MS  120
+
+class RoverC {
+public:
+  void begin() {
+    delay(10);
+    Wire.beginTransmission(ROVERC_I2C_ADDR);
+    Wire.endTransmission();
+  }
+  bool setMotor(uint8_t m, int8_t s) {
+    if (m < 1 || m > 4) return false;
+    Wire.beginTransmission(ROVERC_I2C_ADDR);
+    Wire.write(m - 1);
+    Wire.write(s);
+    return Wire.endTransmission() == 0;
+  }
+  void stop() { for (int i = 1; i <= 4; i++) setMotor(i, 0); }
+
+  void setSpeed(int8_t x, int8_t y, int8_t z) {
+    int16_t m1 = (int16_t)y + x + z;
+    int16_t m2 = (int16_t)y - x - z;
+    int16_t m3 = (int16_t)y - x + z;
+    int16_t m4 = (int16_t)y + x - z;
+    int16_t mabs = max(max(abs(m1), abs(m2)), max(abs(m3), abs(m4)));
+    if (mabs > 127) {
+      float s = 127.0f / mabs;
+      m1 = round(m1 * s); m2 = round(m2 * s);
+      m3 = round(m3 * s); m4 = round(m4 * s);
+    }
+    setMotor(1, m1); setMotor(2, m2);
+    setMotor(3, m3); setMotor(4, m4);
+  }
+};
+
+RoverC rover;
+WebServer server(80);
+
+String apSSID;
+String apURL;
+
+int8_t cmdX = 0, cmdY = 0, cmdZ = 0;
+unsigned long lastCmdMs = 0;
+
+static const char PROGMEM PAGE_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>RoverC</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:100%}
+html,body{height:100dvh;width:100dvw;background:#0b0b10;color:#fff;font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
+#portrait{display:none;height:100%;width:100%;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px}
+#portrait .icon{font-size:48px;margin-bottom:12px;animation:rot 1.5s ease-in-out infinite}
+@keyframes rot{0%{transform:rotate(0)}50%{transform:rotate(90deg)}100%{transform:rotate(90deg)}}
+#portrait h2{font-size:20px;margin-bottom:8px;color:#ff2d55}
+#portrait p{font-size:14px;color:#8e8e93;line-height:1.5}
+#landscape{height:100%;width:100%;display:none;flex-direction:column}
+#h{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
+#t{font-weight:700;color:#ff2d55;font-size:16px;letter-spacing:1px}
+#st{font-size:12px;color:#00e676;display:flex;align-items:center;gap:6px}
+#st::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:#00e676;box-shadow:0 0 8px #00e676}
+#m{flex:1;display:flex;align-items:center;justify-content:space-around;min-height:0;padding:12px 16px;gap:16px}
+.pad{display:flex;flex-direction:column;align-items:center;gap:10px;flex:1;max-width:260px}
+.lbl{font-size:11px;color:#8e8e93;text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
+.joy{width:34vmin;height:34vmin;max-width:170px;max-height:170px;border-radius:50%;background:radial-gradient(circle at 50% 50%,#1c1c26 0%,#111118 100%);border:2px solid rgba(255,255,255,0.12);position:relative;box-shadow:inset 0 0 24px rgba(0,0,0,0.5),0 8px 32px rgba(0,0,0,0.35)}
+.joy::before{content:"";position:absolute;top:50%;left:10%;width:80%;height:1px;background:rgba(255,255,255,0.08);transform:translateY(-50%)}
+.joy::after{content:"";position:absolute;top:10%;left:50%;width:1px;height:80%;background:rgba(255,255,255,0.08);transform:translateX(-50%)}
+.knob{width:34%;height:34%;border-radius:50%;background:linear-gradient(145deg,#ff2d55,#ff5e3a);box-shadow:0 4px 20px rgba(255,45,85,0.45);position:absolute;top:33%;left:33%;pointer-events:none}
+#vals{font-family:monospace;font-size:12px;color:#8e8e93;text-align:center;padding:8px 0 10px;background:rgba(255,255,255,0.02);flex-shrink:0;letter-spacing:0.5px}
+@media (orientation:portrait){#portrait{display:flex}#landscape{display:none}}
+@media (orientation:landscape){#portrait{display:none}#landscape{display:flex}}
+</style>
+</head>
+<body>
+<div id="portrait">
+  <div class="icon">📱</div>
+  <h2>Rotate to Landscape</h2>
+  <p>Please hold your phone horizontally<br>for the dual joystick controller.</p>
+</div>
+<div id="landscape">
+  <div id="h"><span id="t">ROVER C</span><span id="st">LINK</span></div>
+  <div id="m">
+    <div class="pad"><div class="lbl">Move</div><div class="joy" id="joyL"><div class="knob"></div></div></div>
+    <div class="pad"><div class="lbl">Turn</div><div class="joy" id="joyR"><div class="knob"></div></div></div>
+  </div>
+  <div id="vals">x:0 y:0 z:0</div>
+</div>
+<script>
+(function(){'use strict';
+var ax=0,ay=0,az=0;
+var st=document.getElementById('st'),vals=document.getElementById('vals');
+function send(stop){
+  var url='/cmd?x='+ax+'&y='+ay+'&z='+az;
+  vals.textContent='x:'+ax+' y:'+ay+' z:'+az;
+  if(stop){new Image().src=url;}
+  else{fetch(url,{cache:'no-store'}).catch(function(){});}
+}
+function bind(id,hAxis,vAxis){
+  var el=document.getElementById(id),knob=el.querySelector('.knob');
+  function move(dx,dy){
+    var r=el.offsetWidth/2,max=r*0.62,d=Math.sqrt(dx*dx+dy*dy),l=Math.min(d,max)/max,a=Math.atan2(dy,dx);
+    var px=Math.cos(a)*l*max,py=Math.sin(a)*l*max;
+    knob.style.left=(r+px-knob.offsetWidth/2)+'px';
+    knob.style.top=(r+py-knob.offsetHeight/2)+'px';
+    var vx=Math.round(Math.cos(a)*l*100)||0,vy=Math.round(-Math.sin(a)*l*100)||0;
+    if(hAxis==='x')ax=vx;if(hAxis==='z')az=vx;if(vAxis==='y')ay=vy;
+    send(false);
+  }
+  function h(e){e.preventDefault();var t=e.touches[0],r=el.getBoundingClientRect();move(t.clientX-(r.left+r.width/2),t.clientY-(r.top+r.height/2));}
+  el.addEventListener('touchstart',function(e){st.style.color='#ff2d55';h(e);});
+  el.addEventListener('touchmove',h,{passive:false});
+  el.addEventListener('touchend',function(){st.style.color='#00e676';move(0,0);send(true);});
+  el.addEventListener('touchcancel',function(){st.style.color='#00e676';move(0,0);send(true);});
+}
+bind('joyL','x','y');
+bind('joyR','z',null);
+send(true);
+})();
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", PAGE_HTML);
+}
+
+void handleCmd() {
+  lastCmdMs = millis();
+  if (server.hasArg("x")) cmdX = constrain(server.arg("x").toInt(), -100, 100);
+  if (server.hasArg("y")) cmdY = constrain(server.arg("y").toInt(), -100, 100);
+  if (server.hasArg("z")) cmdZ = constrain(server.arg("z").toInt(), -100, 100);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  server.send(200, "text/html", PAGE_HTML);
+}
+
+void updateDisplay() {
+  auto& d = M5.Display;
+  d.fillScreen(BLACK);
+  d.setTextSize(1);
+  d.setTextColor(WHITE, BLACK);
+  d.setCursor(0, 2);
+  d.println("RoverC WiFi");
+  d.setTextColor(ORANGE, BLACK);
+  d.printf("SSID:%s\n", apSSID.c_str());
+  d.setTextColor(GREEN, BLACK);
+  d.printf("URL:%s\n", apURL.c_str());
+  d.setTextColor(WHITE, BLACK);
+  d.setCursor(0, d.height() - 10);
+  d.print("Connect -> open URL");
+}
+
+void setup() {
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n\n=== RoverC WiFi ===");
+
+  auto cfg = M5.config();
+  cfg.internal_imu = false;
+  cfg.internal_rtc = false;
+  cfg.internal_spk = false;
+  cfg.internal_mic = false;
+  M5.begin(cfg);
+
+  M5.Power.setExtOutput(true);
+  delay(200);
+
+  auto& d = M5.Display;
+  d.setRotation(1);
+  d.fillScreen(BLACK);
+  d.setTextSize(2);
+  d.setTextColor(WHITE, BLACK);
+  d.println("RoverC WiFi");
+  d.setTextSize(1);
+
+  Wire.begin((int)0, (int)26, (uint32_t)100000);
+  delay(50);
+  Wire.beginTransmission(ROVERC_I2C_ADDR);
+  bool roverOk = (Wire.endTransmission() == 0);
+  if (roverOk) {
+    rover.begin();
+    d.setTextColor(GREEN, BLACK);
+    d.println("RoverC: OK");
+  } else {
+    d.setTextColor(RED, BLACK);
+    d.println("RoverC: FAIL");
+  }
+  d.setTextColor(WHITE, BLACK);
+  delay(1500);
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  apSSID = "RoverC-" + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
+  apSSID.toUpperCase();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setSleep(false);
+  WiFi.softAPConfig(
+    IPAddress(192, 168, 4, 1),
+    IPAddress(192, 168, 4, 1),
+    IPAddress(255, 255, 255, 0)
+  );
+  WiFi.softAP(apSSID.c_str(), NULL, 6, 0, 1);
+
+  apURL = "http://" + WiFi.softAPIP().toString() + "/";
+
+  Serial.printf("AP SSID: %s\n", apSSID.c_str());
+  Serial.printf("AP IP  : %s\n", WiFi.softAPIP().toString().c_str());
+
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  updateDisplay();
+}
+
+void loop() {
+  server.handleClient();
+  M5.update();
+
+  if (lastCmdMs && (millis() - lastCmdMs > CMD_TIMEOUT_MS)) {
+    cmdX = cmdY = cmdZ = 0;
+  }
+
+  if (cmdX || cmdY || cmdZ) {
+    rover.setSpeed(cmdX, cmdY, cmdZ);
+  } else {
+    rover.stop();
+  }
+
+  if (M5.BtnB.wasPressed()) {
+    cmdX = cmdY = cmdZ = 0;
+    lastCmdMs = 0;
+    rover.stop();
+  }
+
+  if (M5.BtnA.wasPressed()) {
+    updateDisplay();
+  }
+
+  delay(10);
+}
