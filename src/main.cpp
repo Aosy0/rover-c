@@ -4,7 +4,8 @@
 #include <WebServer.h>
 
 #define ROVERC_I2C_ADDR 0x38
-#define CMD_TIMEOUT_MS  120
+#define CMD_TIMEOUT_MS  500
+#define STOP_RESEND_MS  120
 
 class RoverC {
 public:
@@ -46,6 +47,8 @@ String apURL;
 
 int8_t cmdX = 0, cmdY = 0, cmdZ = 0;
 unsigned long lastCmdMs = 0;
+unsigned long lastStopMs = 0;
+unsigned long lastPrintMs = 0;
 
 static const char PROGMEM PAGE_HTML[] = R"rawliteral(
 <!DOCTYPE html>
@@ -95,13 +98,23 @@ html,body{height:100dvh;width:100dvw;background:#0b0b10;color:#fff;font-family:s
 </div>
 <script>
 (function(){'use strict';
-var ax=0,ay=0,az=0;
+var ax=0,ay=0,az=0,seq=0;
 var st=document.getElementById('st'),vals=document.getElementById('vals');
-function send(stop){
-  var url='/cmd?x='+ax+'&y='+ay+'&z='+az;
+var lastAx=0,lastAy=0,lastAz=0,ctrl=null;
+var hasAbort=typeof AbortController!=='undefined';
+function send(force){
+  if(!force&&ax===lastAx&&ay===lastAy&&az===lastAz)return;
+  lastAx=ax;lastAy=ay;lastAz=az;
+  var url='/cmd?x='+ax+'&y='+ay+'&z='+az+'&s='+(++seq);
   vals.textContent='x:'+ax+' y:'+ay+' z:'+az;
-  if(stop){new Image().src=url;}
-  else{fetch(url,{cache:'no-store'}).catch(function(){});}
+  var opt={cache:'no-store'};
+  if(hasAbort){
+    if(ctrl){ctrl.abort();ctrl=null;}
+    ctrl=new AbortController();
+    opt.signal=ctrl.signal;
+    setTimeout(function(){if(ctrl){ctrl.abort();ctrl=null;}},300);
+  }
+  fetch(url,opt).catch(function(){});
 }
 function bind(id,hAxis,vAxis){
   var el=document.getElementById(id),knob=el.querySelector('.knob');
@@ -112,16 +125,17 @@ function bind(id,hAxis,vAxis){
     knob.style.top=(r+py-knob.offsetHeight/2)+'px';
     var vx=Math.round(Math.cos(a)*l*100)||0,vy=Math.round(-Math.sin(a)*l*100)||0;
     if(hAxis==='x')ax=vx;if(hAxis==='z')az=vx;if(vAxis==='y')ay=vy;
-    send(false);
   }
   function h(e){e.preventDefault();var t=e.touches[0],r=el.getBoundingClientRect();move(t.clientX-(r.left+r.width/2),t.clientY-(r.top+r.height/2));}
+  function reset(){st.style.color='#00e676';move(0,0);send(true);}
   el.addEventListener('touchstart',function(e){st.style.color='#ff2d55';h(e);});
   el.addEventListener('touchmove',h,{passive:false});
-  el.addEventListener('touchend',function(){st.style.color='#00e676';move(0,0);send(true);});
-  el.addEventListener('touchcancel',function(){st.style.color='#00e676';move(0,0);send(true);});
+  el.addEventListener('touchend',reset);
+  el.addEventListener('touchcancel',reset);
 }
 bind('joyL','x','y');
 bind('joyR','z',null);
+setInterval(function(){send(false);},80);
 send(true);
 })();
 </script>
@@ -130,6 +144,7 @@ send(true);
 )rawliteral";
 
 void handleRoot() {
+  server.sendHeader("Connection", "close");
   server.send(200, "text/html", PAGE_HTML);
 }
 
@@ -138,10 +153,14 @@ void handleCmd() {
   if (server.hasArg("x")) cmdX = constrain(server.arg("x").toInt(), -100, 100);
   if (server.hasArg("y")) cmdY = constrain(server.arg("y").toInt(), -100, 100);
   if (server.hasArg("z")) cmdZ = constrain(server.arg("z").toInt(), -100, 100);
+  unsigned long seq = server.hasArg("s") ? server.arg("s").toInt() : 0;
+  Serial.printf("[CMD] seq:%lu x:%d y:%d z:%d\n", seq, cmdX, cmdY, cmdZ);
+  server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "OK");
 }
 
 void handleNotFound() {
+  server.sendHeader("Connection", "close");
   server.send(200, "text/html", PAGE_HTML);
 }
 
@@ -234,19 +253,32 @@ void loop() {
   server.handleClient();
   M5.update();
 
+  if (millis() - lastPrintMs >= 100) {
+    lastPrintMs = millis();
+    Serial.printf("[LOOP] cmdX:%d cmdY:%d cmdZ:%d lastCmd:%lu lastStop:%lu\n",
+                  cmdX, cmdY, cmdZ, lastCmdMs, lastStopMs);
+  }
+
   if (lastCmdMs && (millis() - lastCmdMs > CMD_TIMEOUT_MS)) {
     cmdX = cmdY = cmdZ = 0;
+    lastCmdMs = 0;
   }
 
   if (cmdX || cmdY || cmdZ) {
     rover.setSpeed(cmdX, cmdY, cmdZ);
+    lastStopMs = 0;
   } else {
     rover.stop();
+    if (!lastStopMs || (millis() - lastStopMs > STOP_RESEND_MS)) {
+      rover.stop();
+      lastStopMs = millis();
+    }
   }
 
   if (M5.BtnB.wasPressed()) {
     cmdX = cmdY = cmdZ = 0;
     lastCmdMs = 0;
+    lastStopMs = 0;
     rover.stop();
   }
 
