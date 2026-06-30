@@ -2,3 +2,4 @@
 .vscode/
 controller.html
 *.bin
+secrets.h
