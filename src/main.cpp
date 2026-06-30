@@ -2,10 +2,10 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "secrets.h"
 
 #define ROVERC_I2C_ADDR 0x38
 #define CMD_TIMEOUT_MS  500
-#define STOP_RESEND_MS  120
 
 class RoverC {
 public:
@@ -44,11 +44,15 @@ WebServer server(80);
 
 String apSSID;
 String apURL;
+String staIP;
+String staSSID;
+bool useApMode = true;
 
 int8_t cmdX = 0, cmdY = 0, cmdZ = 0;
 unsigned long lastCmdMs = 0;
-unsigned long lastStopMs = 0;
 unsigned long lastPrintMs = 0;
+unsigned long lastMotorMs = 0;
+int8_t lastSentX = 127, lastSentY = 127, lastSentZ = 127;
 
 static const char PROGMEM PAGE_HTML[] = R"rawliteral(
 <!DOCTYPE html>
@@ -100,21 +104,10 @@ html,body{height:100dvh;width:100dvw;background:#0b0b10;color:#fff;font-family:s
 (function(){'use strict';
 var ax=0,ay=0,az=0,seq=0;
 var st=document.getElementById('st'),vals=document.getElementById('vals');
-var lastAx=0,lastAy=0,lastAz=0,ctrl=null;
-var hasAbort=typeof AbortController!=='undefined';
-function send(force){
-  if(!force&&ax===lastAx&&ay===lastAy&&az===lastAz)return;
-  lastAx=ax;lastAy=ay;lastAz=az;
+function send(){
   var url='/cmd?x='+ax+'&y='+ay+'&z='+az+'&s='+(++seq);
   vals.textContent='x:'+ax+' y:'+ay+' z:'+az;
-  var opt={cache:'no-store'};
-  if(hasAbort){
-    if(ctrl){ctrl.abort();ctrl=null;}
-    ctrl=new AbortController();
-    opt.signal=ctrl.signal;
-    setTimeout(function(){if(ctrl){ctrl.abort();ctrl=null;}},300);
-  }
-  fetch(url,opt).catch(function(){});
+  fetch(url,{cache:'no-store'}).catch(function(e){console.log('fetch err',e);});
 }
 function bind(id,hAxis,vAxis){
   var el=document.getElementById(id),knob=el.querySelector('.knob');
@@ -125,9 +118,10 @@ function bind(id,hAxis,vAxis){
     knob.style.top=(r+py-knob.offsetHeight/2)+'px';
     var vx=Math.round(Math.cos(a)*l*100)||0,vy=Math.round(-Math.sin(a)*l*100)||0;
     if(hAxis==='x')ax=vx;if(hAxis==='z')az=vx;if(vAxis==='y')ay=vy;
+    send();
   }
   function h(e){e.preventDefault();var t=e.touches[0],r=el.getBoundingClientRect();move(t.clientX-(r.left+r.width/2),t.clientY-(r.top+r.height/2));}
-  function reset(){st.style.color='#00e676';move(0,0);send(true);}
+  function reset(){st.style.color='#00e676';move(0,0);}
   el.addEventListener('touchstart',function(e){st.style.color='#ff2d55';h(e);});
   el.addEventListener('touchmove',h,{passive:false});
   el.addEventListener('touchend',reset);
@@ -135,8 +129,8 @@ function bind(id,hAxis,vAxis){
 }
 bind('joyL','x','y');
 bind('joyR','z',null);
-setInterval(function(){send(false);},80);
-send(true);
+setInterval(function(){send();},100);
+send();
 })();
 </script>
 </body>
@@ -144,7 +138,6 @@ send(true);
 )rawliteral";
 
 void handleRoot() {
-  server.sendHeader("Connection", "close");
   server.send(200, "text/html", PAGE_HTML);
 }
 
@@ -155,29 +148,39 @@ void handleCmd() {
   if (server.hasArg("z")) cmdZ = constrain(server.arg("z").toInt(), -100, 100);
   unsigned long seq = server.hasArg("s") ? server.arg("s").toInt() : 0;
   Serial.printf("[CMD] seq:%lu x:%d y:%d z:%d\n", seq, cmdX, cmdY, cmdZ);
-  server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "OK");
 }
 
 void handleNotFound() {
-  server.sendHeader("Connection", "close");
   server.send(200, "text/html", PAGE_HTML);
 }
 
 void updateDisplay() {
   auto& d = M5.Display;
-  d.fillScreen(BLACK);
+  d.fillScreen(WHITE);
   d.setTextSize(1);
-  d.setTextColor(WHITE, BLACK);
-  d.setCursor(0, 2);
-  d.println("RoverC WiFi");
-  d.setTextColor(ORANGE, BLACK);
-  d.printf("SSID:%s\n", apSSID.c_str());
-  d.setTextColor(GREEN, BLACK);
-  d.printf("URL:%s\n", apURL.c_str());
-  d.setTextColor(WHITE, BLACK);
-  d.setCursor(0, d.height() - 10);
-  d.print("Connect -> open URL");
+  d.setTextColor(BLACK, WHITE);
+  // Title row
+  d.setCursor(4, 2);
+  d.print("RoverC");
+  d.setTextColor(ORANGE, WHITE);
+  d.drawString("[AP]", 70, 2);
+  // AP SSID
+  d.setTextColor(BLACK, WHITE);
+  d.setCursor(4, 12);
+  d.print("SSID: ");
+  d.print(apSSID);
+  // STA IP (if connected)
+  if (staIP.length()) {
+    d.setCursor(172, 2);
+    d.setTextColor(GREEN, WHITE);
+    d.drawString(staIP, 172, 2);
+  }
+  // URL at bottom
+  d.setCursor(4, 128);
+  d.setTextColor(BLUE, WHITE);
+  d.print(apURL);
+  d.qrcode(apURL.c_str(), -1, 16, 112, 1, true);
 }
 
 void setup() {
@@ -206,7 +209,7 @@ void setup() {
   d.println("RoverC WiFi");
   d.setTextSize(1);
 
-  Wire.begin((int)0, (int)26, (uint32_t)100000);
+  Wire.begin((int)0, (int)26, (uint32_t)400000);
   delay(50);
   Wire.beginTransmission(ROVERC_I2C_ADDR);
   bool roverOk = (Wire.endTransmission() == 0);
@@ -221,25 +224,40 @@ void setup() {
   d.setTextColor(WHITE, BLACK);
   delay(1500);
 
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setSleep(false);
+
   uint8_t mac[6];
   WiFi.macAddress(mac);
   apSSID = "RoverC-" + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
   apSSID.toUpperCase();
 
-  WiFi.mode(WIFI_AP);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.setSleep(false);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(
     IPAddress(192, 168, 4, 1),
     IPAddress(192, 168, 4, 1),
     IPAddress(255, 255, 255, 0)
   );
   WiFi.softAP(apSSID.c_str(), NULL, 6, 0, 1);
+  apURL = "http://192.168.4.1/";
+  useApMode = true;
+  Serial.printf("\nAP SSID: %s\n", apSSID.c_str());
 
-  apURL = "http://" + WiFi.softAPIP().toString() + "/";
-
-  Serial.printf("AP SSID: %s\n", apSSID.c_str());
-  Serial.printf("AP IP  : %s\n", WiFi.softAPIP().toString().c_str());
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("STA: connecting to %s", WIFI_SSID);
+  int staWait = 0;
+  while (WiFi.status() != WL_CONNECTED && staWait < 50) {
+    delay(100);
+    Serial.print(".");
+    staWait++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    staIP = WiFi.localIP().toString();
+    staSSID = WiFi.SSID();
+    Serial.printf("\nSTA Connected: %s (%s)\n", staSSID.c_str(), staIP.c_str());
+  } else {
+    Serial.println("\nSTA: not connected (AP only)");
+  }
 
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
@@ -253,38 +271,38 @@ void loop() {
   server.handleClient();
   M5.update();
 
-  if (millis() - lastPrintMs >= 100) {
-    lastPrintMs = millis();
-    Serial.printf("[LOOP] cmdX:%d cmdY:%d cmdZ:%d lastCmd:%lu lastStop:%lu\n",
-                  cmdX, cmdY, cmdZ, lastCmdMs, lastStopMs);
+  unsigned long now = millis();
+
+  if (now - lastPrintMs >= 100) {
+    lastPrintMs = now;
+    Serial.printf("[LOOP] cmdX:%d cmdY:%d cmdZ:%d lastCmd:%lu\n",
+                  cmdX, cmdY, cmdZ, lastCmdMs);
   }
 
-  if (lastCmdMs && (millis() - lastCmdMs > CMD_TIMEOUT_MS)) {
+  if (lastCmdMs && (now - lastCmdMs > CMD_TIMEOUT_MS)) {
     cmdX = cmdY = cmdZ = 0;
     lastCmdMs = 0;
   }
 
-  if (cmdX || cmdY || cmdZ) {
-    rover.setSpeed(cmdX, cmdY, cmdZ);
-    lastStopMs = 0;
-  } else {
-    rover.stop();
-    if (!lastStopMs || (millis() - lastStopMs > STOP_RESEND_MS)) {
+  bool changed = (cmdX != lastSentX || cmdY != lastSentY || cmdZ != lastSentZ);
+  if (changed || (now - lastMotorMs >= 20)) {
+    lastMotorMs = now;
+    lastSentX = cmdX; lastSentY = cmdY; lastSentZ = cmdZ;
+    if (cmdX || cmdY || cmdZ) {
+      rover.setSpeed(cmdX, cmdY, cmdZ);
+    } else {
       rover.stop();
-      lastStopMs = millis();
     }
   }
 
   if (M5.BtnB.wasPressed()) {
     cmdX = cmdY = cmdZ = 0;
     lastCmdMs = 0;
-    lastStopMs = 0;
+    lastSentX = 127; lastSentY = 127; lastSentZ = 127;
     rover.stop();
   }
 
   if (M5.BtnA.wasPressed()) {
     updateDisplay();
   }
-
-  delay(10);
 }
